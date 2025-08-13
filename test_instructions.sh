@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Test script for TurtleBot3 RealSense Red Box Following
+# This script provides example commands for testing the implementation
+
+echo "TurtleBot3 RealSense Red Box Following Test Commands"
+echo "=================================================="
+echo ""
+
+echo "Prerequisites:"
+echo "- Ensure ROS 2 Humble is sourced"
+echo "- Ensure Ignition Gazebo and ros_ign packages are installed"
+echo "- Build this package with colcon build --packages-select turtlebot3"
+echo "- Source the workspace: source install/setup.bash"
+echo ""
+
+echo "Test 1: Basic simulation with red box (no following)"
+echo "Command:"
+echo "ROS_LOCALHOST_ONLY=1 TURTLEBOT3_MODEL=waffle ros2 launch turtlebot3 simulation.launch.py"
+echo ""
+echo "Expected result:"
+echo "- Ignition Gazebo opens with TurtleBot3 and red box visible"
+echo "- RViz opens with camera feeds and navigation visualization"
+echo "- Robot can be controlled manually via navigation goals"
+echo ""
+
+echo "Test 2: Simulation with red box following enabled"
+echo "Command:"
+echo "ROS_LOCALHOST_ONLY=1 TURTLEBOT3_MODEL=waffle ros2 launch turtlebot3 simulation.launch.py enable_follower:=true"
+echo ""
+echo "Expected result:"
+echo "- Same as Test 1, plus red box follower node starts"
+echo "- Robot should automatically detect and follow the red box"
+echo "- Robot maintains safe distance from red box"
+echo ""
+
+echo "Test 3: Manual follower launch (run after Test 1)"
+echo "Command (in separate terminal):"
+echo "ros2 launch turtlebot3 red_box_follower.launch.py"
+echo ""
+echo "Expected result:"
+echo "- Red box follower node starts and takes control of robot"
+echo "- Robot begins following the red box"
+echo ""
+
+echo "Test 4: Check camera topics"
+echo "Commands:"
+echo "ros2 topic list | grep camera"
+echo "ros2 topic echo /camera/rgb/image_raw --once"
+echo "ros2 topic echo /camera/depth/image_raw --once"
+echo ""
+echo "Expected result:"
+echo "- Camera topics are available and publishing data"
+echo ""
+
+echo "Test 5: Monitor follower behavior"
+echo "Command:"
+echo "ros2 topic echo /cmd_vel"
+echo ""
+echo "Expected result:"
+echo "- Velocity commands published by follower node"
+echo "- Commands change based on red box position"
+echo ""
+
+echo "Troubleshooting:"
+echo "- If simulation doesn't start: Check that TURTLEBOT3_MODEL is set to 'waffle'"
+echo "- If red box not detected: Check camera topics are publishing and box is in view"
+echo "- If robot doesn't move: Check /cmd_vel topic and ensure no other nodes are publishing"
+echo "- If following is erratic: Tune parameters in red_box_follower.py"
+echo ""
+
+echo "For more information, see the README.md file."
