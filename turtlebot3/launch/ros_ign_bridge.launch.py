@@ -30,6 +30,11 @@ def generate_launch_description():
                 # Camera (IGN -> ROS2)
                 '/camera/rgb/image_raw@sensor_msgs/msg/Image[ignition.msgs.Image',
                 '/camera/rgb/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo',
+
+                # Add these to your existing bridge arguments
+                '/camera/depth/image_raw@sensor_msgs/msg/Image[ignition.msgs.Image',
+                '/camera/depth/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo',
+                '/camera/depth/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked',
                 ],
         remappings=[
             ("/odom/tf", "tf"),

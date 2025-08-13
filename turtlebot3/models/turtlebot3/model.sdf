@@ -418,15 +418,15 @@
       <sensor name="camera" type="camera">
         <always_on>true</always_on>
         <visualize>true</visualize>
-        <update_rate>30</update_rate>
+        <update_rate>15</update_rate>
         <camera_info_topic>/camera/rgb/camera_info</camera_info_topic>
         <topic>/camera/rgb/image_raw</topic>
         <ignition_frame_id>camera_rgb_frame</ignition_frame_id>
         <camera name="intel_realsense_r200">
           <horizontal_fov>1.02974</horizontal_fov>
           <image>
-            <width>1920</width>
-            <height>1080</height>
+            <width>640</width>
+            <height>480</height>
             <format>R8G8B8</format>
           </image>
           <clip>
@@ -450,6 +450,57 @@
       <pose>0.005 0.018 0.013 0 0 0</pose>
       <axis>
         <xyz>0 0 1</xyz>
+      </axis>
+    </joint>
+
+    <!-- Add this after your existing camera_rgb_frame link -->
+
+    <link name="camera_depth_frame">
+      <inertial>
+        <pose>0.069 -0.047 0.107 0 0 0</pose>
+        <inertia>
+          <ixx>0.001</ixx>
+          <ixy>0.000</ixy>
+          <ixz>0.000</ixz>
+          <iyy>0.001</iyy>
+          <iyz>0.000</iyz>
+          <izz>0.001</izz>
+        </inertia>
+        <mass>0.035</mass>
+      </inertial>
+      <pose>0.069 -0.047 0.107 0 0 0</pose>
+      <sensor name="depth_camera" type="depth">
+        <always_on>true</always_on>
+        <visualize>true</visualize>
+        <update_rate>15</update_rate>
+        <camera_info_topic>/camera/depth/camera_info</camera_info_topic>
+        <topic>/camera/depth/image_raw</topic>
+        <point_cloud_topic>/camera/depth/points</point_cloud_topic>
+        <ignition_frame_id>camera_depth_frame</ignition_frame_id>
+        <camera name="depth_camera">
+          <horizontal_fov>1.02974</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>480</height>
+            <format>R8G8B8</format>
+          </image>
+          <clip>
+            <near>0.02</near>
+            <far>5.0</far>
+          </clip>
+          <depth_camera>
+            <output>points</output>
+          </depth_camera>
+        </camera>
+      </sensor>
+    </link>
+
+    <joint name="camera_depth_joint" type="fixed">
+      <parent>camera_link</parent>
+      <child>camera_depth_frame</child>
+      <pose>0.01 0.018 0.010 -1.57 0 0</pose>
+      <axis>
+        <xyz>0 1 0</xyz>
       </axis>
     </joint>
 
