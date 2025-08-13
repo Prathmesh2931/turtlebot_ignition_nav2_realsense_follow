@@ -3,6 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -12,6 +13,7 @@ TURTLEBOT3_MODEL = os.environ['TURTLEBOT3_MODEL']   # waffle
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
     world_name = LaunchConfiguration('world_name', default='turtlebot3_world')
+    enable_follower = LaunchConfiguration('enable_follower', default='false')
 
     launch_file_dir = os.path.join(get_package_share_directory('turtlebot3'), 'launch')
 
@@ -48,12 +50,29 @@ def generate_launch_description():
                    '-allow_renaming', 'false'],
         )
     
+    # Spawn red box
+    ignition_spawn_red_box = Node(
+        package='ros_ign_gazebo',
+        executable='create',
+        output='screen',
+        arguments=['-entity', 'red_box',
+                   '-name', 'red_box',
+                   '-file', PathJoinSubstitution([
+                        get_package_share_directory('turtlebot3'),
+                        "models", "red_box", "model.sdf"]),
+                   '-allow_renaming', 'true',
+                   '-x', '2.0',
+                   '-y', '0.0',
+                   '-z', '0.25'],
+        )
+    
     world_only = os.path.join(get_package_share_directory('turtlebot3'), "models", "worlds", "world_only.sdf")
 
     return LaunchDescription([
         ign_resource_path,
         ignition_spawn_entity,
         ignition_spawn_world,
+        ignition_spawn_red_box,
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 [os.path.join(get_package_share_directory('ros_ign_gazebo'),
@@ -72,6 +91,11 @@ def generate_launch_description():
             default_value=world_name,
             description='World name'),
 
+        DeclareLaunchArgument(
+            'enable_follower',
+            default_value='false',
+            description='Enable red box follower node'),
+
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([launch_file_dir, '/ros_ign_bridge.launch.py']),
             launch_arguments={'use_sim_time': use_sim_time}.items(),
@@ -85,5 +109,11 @@ def generate_launch_description():
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource([launch_file_dir, '/navigation2.launch.py']),
             launch_arguments={'use_sim_time': use_sim_time}.items(),
+        ),
+
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([launch_file_dir, '/red_box_follower.launch.py']),
+            launch_arguments={'use_sim_time': use_sim_time}.items(),
+            condition=IfCondition(enable_follower),
         ),
     ])
