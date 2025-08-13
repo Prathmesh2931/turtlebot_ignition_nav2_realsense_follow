@@ -11,8 +11,13 @@ find_package(ament_cmake REQUIRED)
 # further dependencies manually.
 # find_package(<dependency> REQUIRED)
 
-install(DIRECTORY launch models maps params
+install(DIRECTORY launch models maps params rviz
   DESTINATION share/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  src/red_box_follower.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
