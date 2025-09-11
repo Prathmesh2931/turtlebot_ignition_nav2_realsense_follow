@@ -67,7 +67,7 @@ def generate_launch_description():
                             "models","box" ,"pickup_box.sdf"]),
                     '-allow_renaming', 'true',
                     '-x', '-0.0',
-                    '-y', '0.4',
+                    '-y', '-0.4',
                     '-z', '0.1'],
             )
 

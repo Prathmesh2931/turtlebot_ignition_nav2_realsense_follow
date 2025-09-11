@@ -2,19 +2,19 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, PointCloud2, LaserScan
+from sensor_msgs.msg import Image, LaserScan
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
 import numpy as np
 import cv2
 import math
-import time
 from std_msgs.msg import Float32
+import time
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
-class AdaptiveBoxFinder(Node):
+class ExploringBoxFinder(Node):
     def __init__(self):
-        super().__init__('adaptive_box_finder')
+        super().__init__('exploring_box_finder')
         
         # Configure QoS for better reliability
         qos_profile = QoSProfile(
@@ -39,7 +39,7 @@ class AdaptiveBoxFinder(Node):
             self.depth_callback,
             qos_profile)
         
-        # Subscribe to laser scan for environment mapping
+        # Subscribe to laser scan for navigation
         self.scan_sub = self.create_subscription(
             LaserScan,
             '/scan',
@@ -66,33 +66,27 @@ class AdaptiveBoxFinder(Node):
         self.box_detected = False
         self.box_distance = float('inf')
         self.box_position = [0, 0]  # [x, y] in image coordinates
-        self.box_dimensions = [0.1, 0.1, 0.1]  # 10cm box dimensions
         self.box_width = 0
         self.box_height = 0
-        self.last_box_detection_time = None
         
-        # Environment understanding variables
-        self.open_spaces = []  # List of [angle, distance, width] of open spaces
-        self.visited_positions = []  # List of [x, y] positions already visited
-        self.current_position = [0, 0]  # Current estimated position
-        self.current_orientation = 0.0  # Current estimated orientation
-        self.environment_map = np.zeros((100, 100), dtype=np.uint8)  # Simple occupancy grid
-        self.map_resolution = 0.1  # meters per cell
-        self.map_origin = [50, 50]  # Center of the map
+        # State variables
+        self.state = "SCANNING"  # SCANNING, MOVING, APPROACHING, ALIGNING
+        self.scan_start_time = None
+        self.move_start_time = None
+        self.move_duration = 0
+        self.move_direction = 0  # 0: forward, 1: right, 2: left, 3: backward
+        self.rotation_complete = False
+        self.move_complete = False
+        self.move_distance = 0.5  # meters
+        self.scan_count = 0
+        self.unexplored_directions = []  # List of angles that haven't been explored yet
         
-        # Behavioral states
-        self.behavior_state = "EXPLORE"  # EXPLORE, SEARCH, APPROACH, ALIGN
-        self.exploration_start_time = None
-        self.current_goal = None  # [x, y] position to move to
-        self.rotation_start_time = None
-        self.search_timeout = 60.0  # seconds before changing search area
-        self.last_behavior_change_time = self.get_clock().now().seconds_nanoseconds()[0]
-        self.alignment_tolerance = 15.0  # degrees (more relaxed alignment)
-        self.stop_at_close_enough = True  # Stop when reasonably close and aligned
-        self.found_box_once = False  # Flag to know if we've seen the box before
+        # Movement tracking
+        self.current_position = [0, 0]  # Estimated position (x, y)
+        self.current_orientation = 0.0   # Estimated orientation in radians
+        self.visited_positions = []      # List of visited positions
         
         # Box color range in HSV (red box)
-        # Adjust these values based on your actual box color
         self.lower_color = np.array([0, 100, 100])   # Lower red
         self.upper_color = np.array([10, 255, 255])  # Upper red
         self.lower_color2 = np.array([160, 100, 100])  # Lower red (second range)
@@ -101,7 +95,12 @@ class AdaptiveBoxFinder(Node):
         # Control loop timer (10 Hz)
         self.timer = self.create_timer(0.1, self.control_loop)
         
-        self.get_logger().info('Adaptive box finder initialized')
+        # Debug variables
+        self.last_debug_time = self.get_clock().now().seconds_nanoseconds()[0]
+        self.debug_interval = 2.0  # seconds
+        
+        self.get_logger().info('Exploring Box Finder initialized')
+        self.get_logger().info('Starting in SCANNING state')
     
     def rgb_callback(self, msg):
         try:
@@ -117,19 +116,15 @@ class AdaptiveBoxFinder(Node):
         try:
             # Convert ROS Image to OpenCV image
             self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1")
-            
-            # Analyze depth image to find open spaces
-            if self.behavior_state == "EXPLORE" and not self.box_detected:
-                self.find_open_spaces_from_depth()
         except Exception as e:
             self.get_logger().error(f'Error processing depth image: {str(e)}')
     
     def scan_callback(self, msg):
         self.laser_data = msg
         
-        # Update environment map when in explore mode
-        if self.behavior_state == "EXPLORE":
-            self.update_environment_map()
+        # Analyze LIDAR data to find unexplored directions when in SCANNING state
+        if self.state == "SCANNING" and not self.unexplored_directions:
+            self.find_unexplored_directions()
     
     def detect_box(self):
         if self.rgb_image is None:
@@ -166,8 +161,6 @@ class AdaptiveBoxFinder(Node):
                     # Update box position
                     self.box_position = [box_center_x, box_center_y]
                     self.box_detected = True
-                    self.last_box_detection_time = self.get_clock().now().seconds_nanoseconds()[0]
-                    self.found_box_once = True
                     
                     # Get distance from depth image if available
                     if self.depth_image is not None:
@@ -204,263 +197,234 @@ class AdaptiveBoxFinder(Node):
                             distance_msg.data = self.box_distance
                             self.distance_pub.publish(distance_msg)
                             
-                            # If we find the box, switch to APPROACH mode
-                            if self.behavior_state in ["EXPLORE", "SEARCH"]:
-                                self.behavior_state = "APPROACH"
-                                self.get_logger().info(f'Box detected! Switching to APPROACH mode. Distance: {self.box_distance:.3f}m')
+                            # If we find the box, switch to APPROACHING mode
+                            if self.state in ["SCANNING", "MOVING"]:
+                                self.state = "APPROACHING"
+                                self.get_logger().info(f'Box detected! Switching to APPROACHING mode. Distance: {self.box_distance:.3f}m')
                         else:
                             self.get_logger().warn('Box detected but no valid depth measurements')
                     
-                    # Optional: Draw box on image for visualization
-                    debug_image = self.rgb_image.copy()
-                    cv2.rectangle(debug_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    cv2.putText(debug_image, f'Distance: {self.box_distance:.3f}m', 
-                                (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                    
-                    # If you want to publish this image for debugging, add a publisher here
+                    # Optional: Draw box on image for visualization (for debugging)
+                    # debug_image = self.rgb_image.copy()
+                    # cv2.rectangle(debug_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    # cv2.putText(debug_image, f'Distance: {self.box_distance:.3f}m', 
+                    #             (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 else:
                     # No box detected that meets the area threshold
-                    self.handle_box_not_detected()
+                    self.box_detected = False
             else:
                 # No contours found
-                self.handle_box_not_detected()
+                self.box_detected = False
         
         except Exception as e:
             self.get_logger().error(f'Error in box detection: {str(e)}')
     
-    def handle_box_not_detected(self):
-        """Handle the case when the box is not detected"""
-        # Only consider the box lost if it was previously detected
-        if self.box_detected:
-            current_time = self.get_clock().now().seconds_nanoseconds()[0]
-            
-            # If box hasn't been seen for 2 seconds, consider it lost
-            if self.last_box_detection_time and (current_time - self.last_box_detection_time) > 2.0:
-                self.box_detected = False
-                
-                # If we were approaching or aligning, go back to search mode
-                if self.behavior_state in ["APPROACH", "ALIGN"]:
-                    self.behavior_state = "SEARCH"
-                    self.get_logger().info('Box lost. Switching to SEARCH mode.')
-    
-    def find_open_spaces_from_depth(self):
-        """Analyze depth image to find open spaces"""
-        if self.depth_image is None:
-            return
-        
-        try:
-            # Create a binary map of obstacles vs. free space
-            # Pixels with distance > 1.0m are considered open space
-            free_space = np.zeros_like(self.depth_image, dtype=np.uint8)
-            free_space[self.depth_image > 1.0] = 255
-            free_space[np.isnan(self.depth_image) | np.isinf(self.depth_image)] = 0
-            
-            # Apply morphological operations to clean up the map
-            kernel = np.ones((5, 5), np.uint8)
-            free_space = cv2.morphologyEx(free_space, cv2.MORPH_OPEN, kernel)
-            
-            # Find contours of open spaces
-            contours, _ = cv2.findContours(free_space, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            if contours:
-                # Find the largest open space
-                largest_contour = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(largest_contour)
-                
-                if area > 5000:  # Only consider large open spaces
-                    # Get center of the open space
-                    M = cv2.moments(largest_contour)
-                    if M["m00"] > 0:
-                        cx = int(M["m10"] / M["m00"])
-                        cy = int(M["m01"] / M["m00"])
-                        
-                        # Convert to angle from center of image
-                        h, w = self.depth_image.shape
-                        angle = math.atan2(cx - w/2, h/2 - cy)  # Angle in radians
-                        
-                        # Get distance to this point
-                        distance = self.depth_image[cy, cx] if not np.isnan(self.depth_image[cy, cx]) and not np.isinf(self.depth_image[cy, cx]) else 2.0
-                        
-                        # Update open spaces list
-                        self.open_spaces.append([angle, distance, area])
-                        
-                        # Sort open spaces by area (largest first)
-                        self.open_spaces.sort(key=lambda x: x[2], reverse=True)
-                        
-                        # Keep only the top 5 open spaces
-                        self.open_spaces = self.open_spaces[:5]
-                        
-                        self.get_logger().debug(f'Found open space at angle: {math.degrees(angle):.1f}°, distance: {distance:.2f}m, area: {area}')
-        except Exception as e:
-            self.get_logger().error(f'Error finding open spaces: {str(e)}')
-    
-    def update_environment_map(self):
-        """Update the environment map using laser scan data"""
+    def find_unexplored_directions(self):
+        """Find directions that haven't been explored yet using LIDAR data"""
         if self.laser_data is None:
             return
         
-        try:
-            # Convert laser scan to points in the map
-            angle = self.laser_data.angle_min
-            for r in self.laser_data.ranges:
-                if not np.isnan(r) and not np.isinf(r):
-                    # Convert polar to Cartesian coordinates
-                    x = r * math.cos(angle)
-                    y = r * math.sin(angle)
-                    
-                    # Convert to map coordinates
-                    map_x = int(self.map_origin[0] + x / self.map_resolution)
-                    map_y = int(self.map_origin[1] + y / self.map_resolution)
-                    
-                    # Check if coordinates are within map bounds
-                    if 0 <= map_x < self.environment_map.shape[1] and 0 <= map_y < self.environment_map.shape[0]:
-                        # Mark as obstacle
-                        self.environment_map[map_y, map_x] = 255
-                
-                angle += self.laser_data.angle_increment
+        # Convert laser scan to numpy array
+        ranges = np.array(self.laser_data.ranges)
+        angles = np.linspace(self.laser_data.angle_min, self.laser_data.angle_max, len(ranges))
         
-        except Exception as e:
-            self.get_logger().error(f'Error updating environment map: {str(e)}')
-    
-    def find_best_exploration_direction(self):
-        """Find the best direction to explore"""
-        # If we have detected open spaces from the depth image
-        if self.open_spaces:
-            # Return the angle to the largest open space
-            return self.open_spaces[0][0]
+        # Replace inf and nan values with a large number (10.0 meters)
+        ranges[np.isnan(ranges) | np.isinf(ranges)] = 10.0
         
-        # If we have laser data, find the longest distance
-        elif self.laser_data is not None:
-            max_distance = 0
-            max_angle = 0
-            angle = self.laser_data.angle_min
+        # Find directions with large open spaces (range > 2.0m)
+        open_directions = angles[ranges > 2.0]
+        
+        if len(open_directions) > 0:
+            # Cluster open directions into sectors
+            sectors = []
+            current_sector = [open_directions[0]]
             
-            for i, r in enumerate(self.laser_data.ranges):
-                if not np.isnan(r) and not np.isinf(r) and r > max_distance:
-                    max_distance = r
-                    max_angle = angle
-                
-                angle += self.laser_data.angle_increment
+            for i in range(1, len(open_directions)):
+                if open_directions[i] - open_directions[i-1] < 0.2:  # If angles are close
+                    current_sector.append(open_directions[i])
+                else:
+                    # Start a new sector
+                    sectors.append(current_sector)
+                    current_sector = [open_directions[i]]
             
-            return max_angle
-        
-        # Default: turn randomly if no sensor data available
-        return np.random.uniform(-math.pi/4, math.pi/4)
+            # Add the last sector
+            if current_sector:
+                sectors.append(current_sector)
+            
+            # Get the middle angle of each sector
+            sector_angles = [sum(sector) / len(sector) for sector in sectors]
+            
+            # Find the widest sectors
+            sector_widths = [len(sector) * self.laser_data.angle_increment for sector in sectors]
+            
+            # Sort sectors by width (largest first)
+            sorted_indices = np.argsort(sector_widths)[::-1]
+            
+            # Get the middle angles of the top 3 widest sectors
+            self.unexplored_directions = [sector_angles[i] for i in sorted_indices[:3] if i < len(sector_angles)]
+            
+            # Log the unexplored directions
+            angles_degrees = [math.degrees(angle) for angle in self.unexplored_directions]
+            self.get_logger().info(f'Found unexplored directions at: {angles_degrees} degrees')
     
-    def explore_environment(self):
-        """Explore the environment in search of the box"""
+    def is_path_clear(self, direction=0.0, distance=0.5):
+        """Check if the path is clear in the specified direction"""
+        if self.laser_data is None:
+            return False
+        
+        # Convert laser scan to numpy array
+        ranges = np.array(self.laser_data.ranges)
+        angles = np.linspace(self.laser_data.angle_min, self.laser_data.angle_max, len(ranges))
+        
+        # Find angles within 30 degrees of the specified direction
+        angle_diff = np.abs(angles - direction)
+        # Handle angle wrapping
+        angle_diff = np.minimum(angle_diff, 2*math.pi - angle_diff)
+        
+        front_indices = np.where(angle_diff < math.pi/6)[0]  # Within 30 degrees
+        
+        if len(front_indices) > 0:
+            front_ranges = ranges[front_indices]
+            front_ranges = front_ranges[~np.isnan(front_ranges) & ~np.isinf(front_ranges)]
+            
+            if len(front_ranges) > 0:
+                min_range = np.min(front_ranges)
+                return min_range > distance
+        
+        return True  # Default to clear if no valid readings
+    
+    def add_visited_position(self):
+        """Add current position to the list of visited positions"""
+        # Only add if it's sufficiently different from existing positions
+        for pos in self.visited_positions:
+            if math.sqrt((pos[0] - self.current_position[0])**2 + 
+                         (pos[1] - self.current_position[1])**2) < 0.3:
+                return  # Too close to an existing position
+        
+        # Add the current position
+        self.visited_positions.append(self.current_position.copy())
+    
+    def update_position_estimate(self, linear_vel, angular_vel, dt):
+        """Update the estimated position based on velocities"""
+        # Simple odometry calculation
+        dx = linear_vel * math.cos(self.current_orientation) * dt
+        dy = linear_vel * math.sin(self.current_orientation) * dt
+        dtheta = angular_vel * dt
+        
+        self.current_position[0] += dx
+        self.current_position[1] += dy
+        self.current_orientation = (self.current_orientation + dtheta) % (2 * math.pi)
+    
+    def do_scan(self):
+        """Execute a 360-degree scan"""
         vel_msg = Twist()
         
-        # Initialize exploration if it's the first time
-        if self.exploration_start_time is None:
-            self.exploration_start_time = self.get_clock().now().seconds_nanoseconds()[0]
-            self.current_goal = None
-            
-            # Determine best direction to explore
-            explore_angle = self.find_best_exploration_direction()
-            
-            # Set as current goal
-            self.current_goal = explore_angle
-            self.get_logger().info(f'Starting exploration in direction: {math.degrees(explore_angle):.1f}°')
+        # Initialize scan if it's the first time
+        if self.scan_start_time is None:
+            self.scan_start_time = self.get_clock().now().seconds_nanoseconds()[0]
+            self.rotation_complete = False
+            self.get_logger().info('Starting 360-degree scan')
         
         current_time = self.get_clock().now().seconds_nanoseconds()[0]
+        elapsed = current_time - self.scan_start_time
         
-        # Check if we should find a new exploration direction
-        if (current_time - self.exploration_start_time) > 10.0:  # Every 10 seconds
-            # Reset exploration timer
-            self.exploration_start_time = current_time
+        # Complete a full 360-degree rotation in 8 seconds
+        if elapsed < 8.0:
+            angular_velocity = 2 * math.pi / 8.0  # radians/second
+            vel_msg.angular.z = angular_velocity
+        else:
+            # Scan complete
+            self.scan_start_time = None
+            self.rotation_complete = True
+            self.scan_count += 1
+            vel_msg.angular.z = 0.0
             
-            # Find new direction
-            explore_angle = self.find_best_exploration_direction()
-            self.current_goal = explore_angle
-            
-            self.get_logger().info(f'New exploration direction: {math.degrees(explore_angle):.1f}°')
+            # After scanning, transition to MOVING state
+            self.state = "MOVING"
+            self.get_logger().info('Scan complete. Switching to MOVING state.')
         
-        # If we have a goal direction
-        if self.current_goal is not None:
-            # First turn towards the goal direction
-            angle_diff = self.current_goal  # Current goal is the angle to turn
+        return vel_msg
+    
+    def do_move(self):
+        """Move in the best available direction"""
+        vel_msg = Twist()
+        
+        # Initialize movement if it's the first time
+        if self.move_start_time is None:
+            self.move_start_time = self.get_clock().now().seconds_nanoseconds()[0]
+            self.move_complete = False
             
-            if abs(angle_diff) > 0.1:  # If we're not facing the right direction
-                # Turn towards the direction
-                vel_msg.angular.z = 0.3 if angle_diff > 0 else -0.3
+            # Choose a direction to move
+            if self.unexplored_directions:
+                # Take the first unexplored direction
+                self.move_direction = self.unexplored_directions.pop(0)
             else:
-                # We're facing the right direction, move forward
-                vel_msg.linear.x = 0.2
-                
-                # Occasionally look around while moving
-                if np.random.random() < 0.2:  # 20% chance to look around
-                    vel_msg.angular.z = np.random.uniform(-0.2, 0.2)
-        else:
-            # No goal, just spin slowly to look around
-            vel_msg.angular.z = 0.2
-        
-        # Check for obstacles directly ahead
-        if self.laser_data is not None:
-            # Check the front 30 degrees
-            front_indices = np.where(
-                (np.array(range(len(self.laser_data.ranges))) * self.laser_data.angle_increment + 
-                 self.laser_data.angle_min > -math.pi/12) & 
-                (np.array(range(len(self.laser_data.ranges))) * self.laser_data.angle_increment + 
-                 self.laser_data.angle_min < math.pi/12)
-            )[0]
+                # If no unexplored directions, choose a random direction
+                self.move_direction = np.random.uniform(-math.pi, math.pi)
             
-            if len(front_indices) > 0:
-                front_distances = np.array(self.laser_data.ranges)[front_indices]
-                min_front_distance = np.min(front_distances[~np.isnan(front_distances) & ~np.isinf(front_distances)]) if len(front_distances) > 0 else float('inf')
-                
-                # If obstacle is too close and we're moving forward
-                if min_front_distance < 0.5 and vel_msg.linear.x > 0:
-                    vel_msg.linear.x = 0  # Stop forward motion
-                    vel_msg.angular.z = 0.5  # Turn to avoid obstacle
-                    self.get_logger().info(f'Obstacle detected at {min_front_distance:.2f}m, turning to avoid')
-        
-        # Periodically switch to search mode
-        if self.found_box_once and (current_time - self.last_behavior_change_time) > 30.0:
-            self.behavior_state = "SEARCH"
-            self.last_behavior_change_time = current_time
-            self.get_logger().info('Switching to focused SEARCH mode')
-            vel_msg.linear.x = 0
-            vel_msg.angular.z = 0
-        
-        return vel_msg
-    
-    def search_for_box(self):
-        """Perform a more focused search for the box"""
-        vel_msg = Twist()
-        
-        # Initialize rotation if it's the first time
-        if self.rotation_start_time is None:
-            self.rotation_start_time = self.get_clock().now().seconds_nanoseconds()[0]
-            self.get_logger().info('Starting focused search rotation')
+            # Calculate move duration based on distance
+            self.move_duration = self.move_distance / 0.2  # at 0.2 m/s
+            
+            self.get_logger().info(f'Starting to move in direction: {math.degrees(self.move_direction):.1f}° for {self.move_distance:.1f}m')
         
         current_time = self.get_clock().now().seconds_nanoseconds()[0]
-        elapsed = current_time - self.rotation_start_time
+        elapsed = current_time - self.move_start_time
         
-        # Rotate 360 degrees over 10 seconds
-        if elapsed < 10.0:
-            vel_msg.angular.z = 2 * math.pi / 10.0  # Full circle in 10 seconds
+        # First, rotate to face the desired direction
+        angle_diff = self.move_direction - self.current_orientation
+        
+        # Normalize angle to [-pi, pi]
+        while angle_diff > math.pi:
+            angle_diff -= 2*math.pi
+        while angle_diff < -math.pi:
+            angle_diff += 2*math.pi
+        
+        # Debug output
+        now = self.get_clock().now().seconds_nanoseconds()[0]
+        if now - self.last_debug_time > self.debug_interval:
+            self.last_debug_time = now
+            self.get_logger().info(f'Angle diff: {math.degrees(angle_diff):.1f}°, Orientation: {math.degrees(self.current_orientation):.1f}°')
+        
+        # If not facing the right direction yet
+        if abs(angle_diff) > 0.1:
+            vel_msg.angular.z = 0.3 if angle_diff > 0 else -0.3
+            return vel_msg
+        
+        # Now facing the right direction, start moving forward
+        # Check if path is clear
+        if not self.is_path_clear(self.move_direction, self.move_distance):
+            # Path not clear, find another direction
+            self.move_start_time = None  # Reset to choose a new direction
+            self.get_logger().info('Path not clear. Finding another direction.')
+            return vel_msg
+        
+        # Calculate how far we've moved
+        if elapsed < self.move_duration:
+            # Move forward
+            vel_msg.linear.x = 0.2
         else:
-            # After full rotation, move to a new area
-            self.rotation_start_time = None
+            # Movement complete
+            self.move_complete = True
+            self.move_start_time = None
             
-            # Switch back to exploration if we haven't found the box
-            if not self.box_detected:
-                self.behavior_state = "EXPLORE"
-                self.exploration_start_time = None
-                self.get_logger().info('Search complete, box not found. Switching back to EXPLORE mode')
-        
-        # If search takes too long without finding the box
-        if elapsed > self.search_timeout:
-            self.behavior_state = "EXPLORE"
-            self.exploration_start_time = None
-            self.get_logger().info('Search timeout reached. Switching back to EXPLORE mode')
+            # Add current position to visited positions
+            self.add_visited_position()
+            
+            # After moving, go back to scanning
+            self.state = "SCANNING"
+            self.get_logger().info('Move complete. Switching back to SCANNING state.')
         
         return vel_msg
     
-    def approach_box(self):
+    def do_approach(self):
         """Approach the detected box"""
         vel_msg = Twist()
+        
+        # If box is no longer detected, go back to scanning
+        if not self.box_detected:
+            self.state = "SCANNING"
+            self.get_logger().info('Box lost. Switching back to SCANNING state.')
+            return vel_msg
         
         # Calculate distance to maintain (box radius + target distance)
         box_radius = 0.05  # 5 cm radius for a 10cm box
@@ -468,63 +432,57 @@ class AdaptiveBoxFinder(Node):
         
         # Check if we need to switch to alignment mode
         if abs(self.box_distance - desired_distance) < 0.05:  # Within 5cm of desired distance
-            self.behavior_state = "ALIGN"
-            self.get_logger().info('Close enough to desired distance. Switching to ALIGN mode')
+            self.state = "ALIGNING"
+            self.get_logger().info('Close enough to desired distance. Switching to ALIGNING state.')
             return vel_msg
         
-        # If we're further than the desired distance, move toward the box
-        if self.box_distance > desired_distance:
-            # Calculate speed based on distance (slow down as we get closer)
-            # More human-like: start slower, then speed up, then slow down again
-            dist_diff = self.box_distance - desired_distance
+        # Center the box in the image
+        if self.rgb_image is not None:
+            image_width = self.rgb_image.shape[1]
+            image_center_x = image_width // 2
             
-            # Sigmoidal speed profile
-            speed = 0.3 / (1 + math.exp(-5 * (dist_diff - 0.5)))
-            speed = max(0.05, min(0.2, speed))  # Clamp between 0.05 and 0.2 m/s
+            # Calculate error in pixels
+            error_x = self.box_position[0] - image_center_x
+            
+            # Apply angular velocity to center the box
+            angular_velocity = -error_x * 0.001
+            vel_msg.angular.z = angular_velocity
+        
+        # If we're further than the desired distance, move toward the box
+        if self.box_distance > desired_distance + 0.01:  # 1cm tolerance
+            # Calculate speed based on distance (slow down as we get closer)
+            speed = min(0.2, max(0.05, (self.box_distance - desired_distance) * 0.5))
             
             # Set linear velocity to approach the box
             vel_msg.linear.x = speed
             
-            # Calculate angular velocity to center the box in the image
-            if self.rgb_image is not None:
-                image_width = self.rgb_image.shape[1]
-                image_center_x = image_width // 2
-                
-                # Calculate error in pixels
-                error_x = self.box_position[0] - image_center_x
-                
-                # Human-like steering: more aggressive when error is large
-                angular_velocity = -error_x * 0.001 * (1 + abs(error_x) / 100)
-                vel_msg.angular.z = angular_velocity
-            
             self.get_logger().info(f'Moving toward box. Distance: {self.box_distance:.3f}m, Target: {desired_distance:.3f}m, Speed: {speed:.3f}m/s')
-        elif self.box_distance < desired_distance - 0.03:  # Too close, back up (with more tolerance)
+        elif self.box_distance < desired_distance - 0.01:  # Too close, back up
             # Calculate speed based on distance
-            speed = min(0.1, max(0.05, (desired_distance - self.box_distance) * 0.3))
+            speed = min(0.1, max(0.05, (desired_distance - self.box_distance) * 0.5))
             
             # Set linear velocity to back away from the box
             vel_msg.linear.x = -speed
             
             self.get_logger().info(f'Backing away from box. Distance: {self.box_distance:.3f}m, Target: {desired_distance:.3f}m')
         else:
-            # We're close enough to the desired distance
-            self.behavior_state = "ALIGN"
-            self.get_logger().info(f'At target distance: {self.box_distance:.3f}m. Switching to ALIGN mode')
+            # We're at the desired distance
+            self.state = "ALIGNING"
+            self.get_logger().info(f'At target distance: {self.box_distance:.3f}m. Switching to ALIGNING state.')
         
         return vel_msg
     
-    def align_with_box(self):
+    def do_align(self):
         """Align with the box at approximately 90 degrees"""
         vel_msg = Twist()
         
-        # If box is no longer detected, go back to search
+        # If box is no longer detected, go back to scanning
         if not self.box_detected:
-            self.behavior_state = "SEARCH"
-            self.get_logger().info('Box lost during alignment. Switching to SEARCH mode')
+            self.state = "SCANNING"
+            self.get_logger().info('Box lost during alignment. Switching back to SCANNING state.')
             return vel_msg
         
-        # Check if we're roughly aligned with the box
-        # For a square box, we look at aspect ratio
+        # Check if we're roughly aligned with the box (square appearance)
         aspect_ratio = float(self.box_width) / self.box_height if self.box_height > 0 else 1.0
         
         # More relaxed alignment check (15% tolerance)
@@ -540,7 +498,7 @@ class AdaptiveBoxFinder(Node):
             is_centered = abs(error_x) < 30  # More relaxed centering (30 pixels)
             
             if not is_centered:
-                # Calculate angular velocity to center
+                # Apply angular velocity to center the box
                 angular_velocity = -error_x * 0.0005
                 vel_msg.angular.z = angular_velocity
                 self.get_logger().info(f'Centering on box. Error: {error_x} pixels')
@@ -551,10 +509,10 @@ class AdaptiveBoxFinder(Node):
             # If the box appears wider than tall or vice versa
             if aspect_ratio > 1.15:  # Box is wider than tall
                 vel_msg.angular.z = 0.1  # Rotate clockwise
-                self.get_logger().info('Aligning with box: rotating clockwise')
+                self.get_logger().info(f'Aligning with box: rotating clockwise. Aspect ratio: {aspect_ratio:.2f}')
             elif aspect_ratio < 0.85:  # Box is taller than wide
                 vel_msg.angular.z = -0.1  # Rotate counter-clockwise
-                self.get_logger().info('Aligning with box: rotating counter-clockwise')
+                self.get_logger().info(f'Aligning with box: rotating counter-clockwise. Aspect ratio: {aspect_ratio:.2f}')
         else:
             # We're aligned enough - human-like behavior doesn't need perfect alignment
             self.get_logger().info('Box alignment achieved! Mission complete.')
@@ -562,9 +520,6 @@ class AdaptiveBoxFinder(Node):
             # Stop the robot
             vel_msg.linear.x = 0
             vel_msg.angular.z = 0
-            
-            # Optional: Add a flag to indicate success
-            self.stop_at_close_enough = False  # Prevent further movement
         
         return vel_msg
     
@@ -574,29 +529,27 @@ class AdaptiveBoxFinder(Node):
         vel_msg = Twist()
         
         # Execute behavior based on current state
-        if self.behavior_state == "EXPLORE":
-            vel_msg = self.explore_environment()
+        if self.state == "SCANNING":
+            vel_msg = self.do_scan()
         
-        elif self.behavior_state == "SEARCH":
-            vel_msg = self.search_for_box()
+        elif self.state == "MOVING":
+            vel_msg = self.do_move()
         
-        elif self.behavior_state == "APPROACH":
-            vel_msg = self.approach_box()
+        elif self.state == "APPROACHING":
+            vel_msg = self.do_approach()
         
-        elif self.behavior_state == "ALIGN":
-            vel_msg = self.align_with_box()
+        elif self.state == "ALIGNING":
+            vel_msg = self.do_align()
         
-        # If we're supposed to stop when close enough
-        if not self.stop_at_close_enough and self.behavior_state == "ALIGN":
-            vel_msg.linear.x = 0
-            vel_msg.angular.z = 0
+        # Estimate position based on velocities (simple odometry)
+        self.update_position_estimate(vel_msg.linear.x, vel_msg.angular.z, 0.1)  # dt = 0.1s
         
         # Publish velocity command
         self.cmd_vel_pub.publish(vel_msg)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = AdaptiveBoxFinder()
+    node = ExploringBoxFinder()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
