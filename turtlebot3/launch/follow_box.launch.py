@@ -6,7 +6,9 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 
-TURTLEBOT3_MODEL = os.environ['TURTLEBOT3_MODEL']   # waffle
+# TURTLEBOT3_MODEL = os.environ['TURTLEBOT3_MODEL']   # waffle
+TURTLEBOT3_MODEL = os.environ.get('TURTLEBOT3_MODEL', 'waffle')
+
 
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
