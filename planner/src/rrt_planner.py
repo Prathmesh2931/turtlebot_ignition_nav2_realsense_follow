@@ -1,282 +1,331 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, Twist, Point
-from nav_msgs.msg import Path, Odometry
-from sensor_msgs.msg import LaserScan, Image
-import random
-import math
-import tf2_ros
-import cv_bridge
-from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import PoseStamped, Quaternion
+from std_msgs.msg import Bool, String
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path, Odometry, OccupancyGrid
+from sensor_msgs.msg import LaserScan
+import math, random, time
 
-class RRTPlanner(Node):
+class PlannerNode(Node):
     def __init__(self):
-        super().__init__("rrt_planner")
+        super().__init__('rrt_planner_node')
 
-        # Parameters (tweak as required)
-        self.declare_parameter('max_nodes', 5000)
+        # ---------- Parameters ----------
+        self.declare_parameter('max_nodes', 3000)
         self.declare_parameter('step_size', 0.35)
-        self.declare_parameter('goal_threshold', 0.15)
+        self.declare_parameter('goal_threshold', 0.05)
         self.declare_parameter('world_bounds', [-5.0, 5.0, -5.0, 5.0])
-        self.declare_parameter('min_clearance', 0.20)   # minimum clearance (meters)
-        self.declare_parameter('robot_radius', 0.15)    # robot radius to inflate obstacles
-        self.declare_parameter('solution_sample_prob', 0.12) # prob to sample goal
-        self.declare_parameter('follow_distance_thresh', 0.18)
-        self.declare_parameter('scan_stop_dist', 0.15)  # emergency stop distance
+        self.declare_parameter('min_clearance', 0.15)
+        self.declare_parameter('robot_radius', 0.15)
+        self.declare_parameter('goal_sample_prob', 0.12)
 
+        self.declare_parameter('replan_cooldown', 2.0)
+        self.declare_parameter('planning_timeout', 1.5)
+
+        # map usage
+        self.declare_parameter('use_map_if_available', True)
+        self.declare_parameter('map_inflation_cells', 1)  # inflate obstacles in grid
+
+        # advanced
+        self.declare_parameter('connect_goal_steps', 6)  # intermediate samples when trying to directly connect to goal
+        self.declare_parameter('segment_check_step', 0.05)  # sampling resolution when checking segment collisions
+
+        # load parameters
         self.max_nodes = self.get_parameter('max_nodes').value
         self.step_size = self.get_parameter('step_size').value
         self.goal_threshold = self.get_parameter('goal_threshold').value
         self.world_bounds = self.get_parameter('world_bounds').value
         self.min_clearance = self.get_parameter('min_clearance').value
         self.robot_radius = self.get_parameter('robot_radius').value
-        self.solution_sample_prob = self.get_parameter('solution_sample_prob').value
-        self.follow_distance_thresh = self.get_parameter('follow_distance_thresh').value
-        self.scan_stop_dist = self.get_parameter('scan_stop_dist').value
+        self.goal_sample_prob = self.get_parameter('goal_sample_prob').value
 
-        # State
-        self.start = None
-        self.goal = None
+        self.replan_cooldown = self.get_parameter('replan_cooldown').value
+        self.planning_timeout = self.get_parameter('planning_timeout').value
+
+        self.use_map_if_available = self.get_parameter('use_map_if_available').value
+        self.map_inflation_cells = int(self.get_parameter('map_inflation_cells').value)
+
+        self.connect_goal_steps = int(self.get_parameter('connect_goal_steps').value)
+        self.segment_check_step = float(self.get_parameter('segment_check_step').value)
+
+        # ---------- State ----------
         self.current_pose = None
-        self.obstacles = []       # raw obstacles in robot frame: list of ((cx,cy),(w,h))
-        self.obstacles_odom = []  # obstacles converted to odom frame: list of ((x,y),(w,h))
-        self.path = []
+        self.goal = None
+        self.obstacles = []       # lidar points in robot frame
+        self.obstacles_odom = []  # lidar points in odom frame
         self.is_planning = False
-        self.has_goal = False
-        self.latest_scan = None
+        self.last_replan_time = 0.0
 
-        # TF and CV bridge (kept for future use)
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.bridge = cv_bridge.CvBridge()
+        # occupancy grid (optional)
+        self.map = None    # nav_msgs/OccupancyGrid
+        self.map_data = None
+        self.map_info = None
 
-        # Publishers
-        self.path_pub = self.create_publisher(Path, "/rrt_path", 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        self.marker_pub = self.create_publisher(MarkerArray, "/rrt_markers", 10)
+        # Publishers & Subscribers
+        self.path_pub = self.create_publisher(Path, '/rrt_path', 10)
+        self.status_pub = self.create_publisher(String, '/rrt_status', 10)
 
-        # Subscribers
-        self.goal_sub = self.create_subscription(PoseStamped, "/goal_pose", self.goal_callback, 10)
-        self.odom_sub = self.create_subscription(Odometry, "/odom", self.odom_callback, 20)
-        self.scan_sub = self.create_subscription(LaserScan, "/scan", self.scan_callback, 20)
-        self.depth_sub = self.create_subscription(Image, "/camera/depth/image_raw", self.depth_callback, 1)
+        self.create_subscription(PoseStamped, '/goal_pose', self.goal_cb, 10)
+        self.create_subscription(Odometry, '/odom', self.odom_cb, 20)
+        self.create_subscription(LaserScan, '/scan', self.scan_cb, 20)
+        self.create_subscription(Bool, '/replan_request', self.replan_cb, 10)
+        self.create_subscription(OccupancyGrid, '/map', self.map_cb, 1)
 
-        # Control loop
-        self.timer = self.create_timer(0.1, self.control_loop)
+        self.create_timer(0.5, self.timer_cb)
 
-        self.get_logger().info("RRT Planner Node initialized")
+        self.get_logger().info('PlannerNode initialized (improved RRT with map support & partial path fallback)')
 
     # ---------- Callbacks ----------
-    def goal_callback(self, msg: PoseStamped):
-        self.get_logger().info(f"Received new goal: ({msg.pose.position.x:.2f}, {msg.pose.position.y:.2f})")
+    def goal_cb(self, msg: PoseStamped):
         self.goal = (msg.pose.position.x, msg.pose.position.y)
-        self.has_goal = True
+        self.get_logger().info(f'New goal: {self.goal}')
         self.is_planning = True
+        self.last_replan_time = 0.0  # allow immediate planning for new goal
 
-    def odom_callback(self, msg: Odometry):
+    def odom_cb(self, msg: Odometry):
         self.current_pose = msg.pose.pose
-        # update start for planning when planning triggered
-        if self.is_planning and self.current_pose is not None:
-            self.start = (self.current_pose.position.x, self.current_pose.position.y)
-            # If we have raw laser obstacles, convert them to odom now (keep up-to-date)
-            if self.obstacles:
-                self._build_obstacles_odom()
+        if self.obstacles:
+            self._build_obstacles_odom()
 
-    def scan_callback(self, msg: LaserScan):
-        self.latest_scan = msg
-        # convert ranges to obstacle points in robot frame
-        obstacles = []
+    def scan_cb(self, msg: LaserScan):
+        pts = []
         angle = msg.angle_min
         for r in msg.ranges:
-            if msg.range_min < r < msg.range_max and not math.isinf(r):
+            if r > msg.range_min and r < msg.range_max and not math.isinf(r):
                 x = r * math.cos(angle)
                 y = r * math.sin(angle)
-                # store small box around the point (w,h)
-                obstacles.append(((x, y), (0.12, 0.12)))
+                pts.append((x, y))
             angle += msg.angle_increment
-        self.obstacles = obstacles
-        # build odom-frame obstacle list (if we have odom)
-        if self.current_pose is not None:
+        self.obstacles = pts
+        if self.current_pose:
             self._build_obstacles_odom()
-        else:
-            self.obstacles_odom = []
 
-    def depth_callback(self, msg: Image):
-        # placeholder for later depth-to-obstacles; not used now
-        pass
+    def map_cb(self, msg: OccupancyGrid):
+        # store map for occupancy checks
+        self.map = msg
+        self.map_info = msg.info
+        self.map_data = msg.data  # flattened list
+        self.get_logger().debug('Map received: size %d x %d' % (self.map_info.width, self.map_info.height))
 
-    def _build_obstacles_odom(self):
-        """Convert robot-frame obstacles to odom-frame obstacle centers (cached)."""
-        odom_list = []
-        for (cx, cy), (w, h) in self.obstacles:
-            ox, oy = self._robot_frame_point_to_odom(cx, cy)
-            odom_list.append(((ox, oy), (w, h)))
-        self.obstacles_odom = odom_list
-
-    # ---------- Main loop ----------
-    def control_loop(self):
-        if not self.has_goal or self.current_pose is None:
+    def replan_cb(self, msg: Bool):
+        now = self.get_clock().now().seconds_nanoseconds()[0] + self.get_clock().now().seconds_nanoseconds()[1]*1e-9
+        if not msg.data:
             return
-
-        # Emergency stop if scan reports very close obstacle
-        if (self.latest_scan is not None and
-            any([(r < self.scan_stop_dist) for r in self.latest_scan.ranges if r > 0 and not math.isinf(r)])):
-            self.get_logger().warn("Emergency stop: obstacle too close!")
-            self.publish_zero_velocity()
-            return
-
         if self.is_planning:
-            self.plan_path()
+            self.get_logger().debug('Planner: already planning — ignoring replan request')
+            return
+        if now - self.last_replan_time < self.replan_cooldown:
+            self.get_logger().debug('Planner: replan request in cooldown — ignoring')
+            return
+        self.get_logger().info('Replan requested')
+        self.is_planning = True
+        self.last_replan_time = now
+
+    def timer_cb(self):
+        if self.is_planning:
+            self.plan_and_publish()
             self.is_planning = False
 
-        if self.path:
-            self.follow_path()
-
-    # ---------- Planner ----------
-    def plan_path(self):
-        if self.start is None or self.goal is None:
-            self.get_logger().warn("Cannot plan: start or goal not set")
+    # ---------- Planning ----------
+    def plan_and_publish(self):
+        if self.current_pose is None or self.goal is None:
+            self.get_logger().warn('Planner: missing start or goal')
+            self._publish_status('failed')
             return
 
-        self.get_logger().info("Starting RRT planning (multi-solution search)...")
+        start = (self.current_pose.position.x, self.current_pose.position.y)
+        goal = self.goal
 
-        nodes = [self.start]
-        parents = {self.start: None}
+        # quick checks: if start or goal inside known obstacle (map or lidar), warn/attempt slight shift
+        if self._point_in_inflated_obstacle(start):
+            self.get_logger().warn('Start appears inside inflated obstacle; planner will try but result may fail')
+        if self._point_in_inflated_obstacle(goal):
+            self.get_logger().warn('Goal appears inside inflated obstacle; planner will try but result may fail')
+
+        self.get_logger().info('Starting RRT planning...')
+        nodes = [start]
+        parents = {start: None}
         candidate_paths = []
 
+        start_time = time.time()
+        best_node = start
+        best_dist = math.dist(start, goal)
+
         for i in range(self.max_nodes):
-            # biased sampling toward goal
-            if random.random() < self.solution_sample_prob:
-                rnd = self.goal
+            # time-based timeout
+            if (time.time() - start_time) > self.planning_timeout:
+                self.get_logger().warn('Planner: planning timeout reached, aborting search')
+                break
+
+            # sample (with goal bias)
+            if random.random() < self.goal_sample_prob:
+                rnd = goal
             else:
-                rnd = (random.uniform(self.world_bounds[0], self.world_bounds[1]),
-                       random.uniform(self.world_bounds[2], self.world_bounds[3]))
+                rnd = self._sample_free()
 
             # nearest node
             nearest = min(nodes, key=lambda n: (n[0]-rnd[0])**2 + (n[1]-rnd[1])**2)
 
-            # step toward rnd
+            # steer: step from nearest toward rnd
             theta = math.atan2(rnd[1]-nearest[1], rnd[0]-nearest[0])
             new_node = (nearest[0] + self.step_size*math.cos(theta),
                         nearest[1] + self.step_size*math.sin(theta))
 
-            # collision check for the node (inflated by robot radius + clearance)
-            if self.in_collision(new_node, clearance=self.min_clearance):
+            # collision check for node and segment
+            if self._in_collision(new_node, clearance=self.min_clearance):
+                continue
+            if not self._segment_free(nearest, new_node, step=self.segment_check_step, clearance=self.min_clearance):
                 continue
 
-            # check the segment from nearest -> new_node is also collision-free
-            if not self.collision_free_segment(nearest, new_node, step=0.05, clearance=self.min_clearance):
-                continue
-
+            # append
             nodes.append(new_node)
             parents[new_node] = nearest
 
-            # if close to goal, save candidate path (but continue searching)
-            if math.dist(new_node, self.goal) < self.goal_threshold:
-                path = self.extract_path(new_node, parents)
-                candidate_paths.append(path)
+            # update best node (closest encountered node to goal) for partial fallback
+            d_to_goal = math.dist(new_node, goal)
+            if d_to_goal < best_dist:
+                best_dist = d_to_goal
+                best_node = new_node
 
-        if not candidate_paths:
-            self.get_logger().warn("No solutions found within node limit.")
-            self.publish_markers(nodes, [])
+            # Attempt direct connect to goal from new_node (in multiple small steps)
+            if self._try_connect_to_goal(new_node, goal):
+                path = self._extract_path(new_node, parents)
+                # append exact goal as final point
+                path.append(goal)
+                candidate_paths.append(path)
+                # **we don't break immediately** — still allow finding other candidates, but you could break to speed up
+                # break
+
+        # If any candidate paths, choose best
+        if candidate_paths:
+            best = min(candidate_paths, key=self._path_cost)
+            best_smoothed = self._smooth(best, iterations=60)
+            self._publish_path(best_smoothed)
+            self._publish_status('success')
+            self.get_logger().info(f'Planner: SUCCESS — published path with {len(best_smoothed)} points')
             return
 
-        # Evaluate candidate paths using cost function
-        best_path = min(candidate_paths, key=self.path_cost)
-        self.get_logger().info(f"Found {len(candidate_paths)} candidate paths. Best cost: {self.path_cost(best_path):.3f}")
+        # No full solution found — fallback: publish partial path to best_node found (if improved)
+        if best_node != start:
+            self.get_logger().info('Planner: no full solution; returning partial path toward best node')
+            partial_path = self._extract_path(best_node, parents)
+            # optionally append an intermediate point toward goal (one step) if free
+            # but ensure that intermediate segment is collision-free
+            try_next = (best_node[0] + (goal[0]-best_node[0]) * 0.5,
+                        best_node[1] + (goal[1]-best_node[1]) * 0.5)
+            if not self._in_collision(try_next, clearance=self.min_clearance) and \
+               self._segment_free(best_node, try_next, step=self.segment_check_step, clearance=self.min_clearance):
+                partial_path.append(try_next)
+            # publish partial path
+            self._publish_path(partial_path)
+            self._publish_status('partial')
+            self.get_logger().info(f'Planner: PARTIAL — published partial path with {len(partial_path)} points (dist to goal {best_dist:.3f})')
+            return
 
-        # Smooth the best path (respect clearance during smoothing)
-        smoothed = self.smooth_path(best_path, iterations=80)
-        self.path = smoothed
-        self.publish_path(self.path)
-        self.publish_markers(nodes, self.path)
-        self.get_logger().info(f"Published best smoothed path with {len(self.path)} points.")
+        # Nothing found
+        self.get_logger().warn('Planner: no solution within node limit or timeout, and no partial progress')
+        self._publish_status('failed')
 
-    # ---------- Collision & Cost ----------
-    def in_collision(self, point, clearance=None):
-        """
-        Check if a point (in odom frame) violates clearance from obstacles.
-        Uses cached self.obstacles_odom. The clearance used is (clearance + robot_radius).
-        """
-        if self.current_pose is None:
-            return True  # unsafe to assume free before having pose
+    # ---------- Utilities ----------
+    def _sample_free(self):
+        """Sample a point either uniformly in world bounds, or from map free cells if map available."""
+        if self.use_map_if_available and self.map is not None and self.map_info is not None:
+            # sample by picking random free cell
+            # simple approach: random attempts until free cell found (bounded tries)
+            for _ in range(50):
+                idx_x = random.randint(0, self.map_info.width-1)
+                idx_y = random.randint(0, self.map_info.height-1)
+                i = idx_y * self.map_info.width + idx_x
+                val = self.map_data[i]
+                if val == 0:  # free cell
+                    # convert map index to world coords
+                    wx = self.map_info.origin.position.x + (idx_x + 0.5) * self.map_info.resolution
+                    wy = self.map_info.origin.position.y + (idx_y + 0.5) * self.map_info.resolution
+                    return (wx, wy)
+            # fallback to uniform
+        # uniform sample in world bounds
+        return (random.uniform(self.world_bounds[0], self.world_bounds[1]),
+                random.uniform(self.world_bounds[2], self.world_bounds[3]))
 
-        if clearance is None:
-            clearance = self.min_clearance
-
-        effective_clear = clearance + self.robot_radius
-
-        x, y = point
-        if not self.obstacles_odom:
-            return False
-
-        for (ox, oy), (w, h) in self.obstacles_odom:
-            # distance from obstacle center
-            dist = math.hypot(x - ox, y - oy)
-            # approximate obstacle "radius" from w,h (diagonal / 2)
-            obs_radius = math.hypot(w/2.0, h/2.0)
-            if dist < (effective_clear + obs_radius):
+    def _point_in_inflated_obstacle(self, p):
+        """Check if point p is inside inflated obstacle (map or lidar)."""
+        if self.use_map_if_available and self.map is not None:
+            return self._map_in_collision(p, inflation=self.map_inflation_cells)
+        # else use lidar obstacles
+        for (ox, oy) in getattr(self, 'obstacles_odom', []):
+            if math.hypot(p[0]-ox, p[1]-oy) < (self.min_clearance + self.robot_radius):
                 return True
         return False
 
-    def collision_free_segment(self, a, b, step=0.05, clearance=None):
-        """Sample along segment a->b and ensure no sample point is in collision."""
-        for p in self.interpolate(a, b, step=step):
-            if self.in_collision(p, clearance=clearance):
+    def _in_collision(self, point, clearance=None):
+        """Collision check: prefer map lookup if map exists, otherwise use lidar points with inflated radius."""
+        if clearance is None:
+            clearance = self.min_clearance
+        if self.use_map_if_available and self.map is not None:
+            return self._map_in_collision(point, inflation=math.ceil((clearance + self.robot_radius) / self.map_info.resolution))
+        # lidar-based
+        eff = clearance + self.robot_radius
+        if not getattr(self, 'obstacles_odom', None):
+            return False
+        x, y = point
+        for (ox, oy) in self.obstacles_odom:
+            if math.hypot(x-ox, y-oy) < eff:
+                return True
+        return False
+
+    def _map_in_collision(self, point, inflation=0):
+        """Check occupancy grid: returns True if cell or neighborhood flagged occupied."""
+        if self.map is None:
+            return False
+        mx = int((point[0] - self.map_info.origin.position.x) / self.map_info.resolution)
+        my = int((point[1] - self.map_info.origin.position.y) / self.map_info.resolution)
+        w = self.map_info.width
+        h = self.map_info.height
+        for dx in range(-inflation, inflation+1):
+            for dy in range(-inflation, inflation+1):
+                ix = mx + dx
+                iy = my + dy
+                if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                    # treat out-of-map as occupied
+                    return True
+                val = self.map_data[iy*w + ix]
+                if val > 50:  # occupied threshold
+                    return True
+        return False
+
+    def _segment_free(self, a, b, step=0.05, clearance=None):
+        pts = self._interpolate(a, b, step)
+        for p in pts:
+            if self._in_collision(p, clearance=clearance):
                 return False
         return True
 
-    def path_cost(self, path):
-        """
-        Cost = path length + clearance penalty (heavy penalty for segments that come closer than threshold).
-        Lower cost is better.
-        """
-        if not path or len(path) < 2:
-            return float('inf')
+    def _try_connect_to_goal(self, node, goal):
+        """Try to connect node -> goal by checking several small steps (in case goal isn't exactly within goal_threshold)."""
+        # Fast accept if close
+        if math.dist(node, goal) < self.goal_threshold:
+            return True
+        # create intermediate points
+        for t in range(1, self.connect_goal_steps+1):
+            alpha = t / float(self.connect_goal_steps)
+            p = (node[0] + alpha*(goal[0]-node[0]), node[1] + alpha*(goal[1]-node[1]))
+            if self._in_collision(p, clearance=self.min_clearance):
+                return False
+        return True
 
-        length = 0.0
-        clearance_penalty = 0.0
-        for i in range(len(path)-1):
-            a = path[i]
-            b = path[i+1]
-            seg_len = math.dist(a, b)
-            length += seg_len
+    def _build_obstacles_odom(self):
+        odom_pts = []
+        yaw = self._quat_to_yaw(self.current_pose.orientation)
+        rx = self.current_pose.position.x
+        ry = self.current_pose.position.y
+        for (cx, cy) in self.obstacles:
+            ox = rx + (cx * math.cos(yaw) - cy * math.sin(yaw))
+            oy = ry + (cx * math.sin(yaw) + cy * math.cos(yaw))
+            odom_pts.append((ox, oy))
+        self.obstacles_odom = odom_pts
 
-            # Evaluate clearance at segment mid-point
-            mid = ((a[0]+b[0])/2.0, (a[1]+b[1])/2.0)
-            min_dist = self._min_dist_to_obstacles(mid)
-            # threshold for penalty
-            threshold = self.min_clearance * 1.5 + self.robot_radius
-            if min_dist < threshold:
-                clearance_penalty += (threshold - min_dist) ** 2 * 15.0  # squared penalty
-
-        return length + clearance_penalty
-
-    def _min_dist_to_obstacles(self, point):
-        """Return minimum euclidean distance from 'point' to any known obstacle center (odom frame)."""
-        if not self.obstacles_odom:
-            return float('inf')
-        x, y = point
-        min_d = float('inf')
-        for (ox, oy), _ in self.obstacles_odom:
-            d = math.hypot(x-ox, y-oy)
-            if d < min_d:
-                min_d = d
-        return min_d
-
-    def _robot_frame_point_to_odom(self, rx, ry):
-        """Convert point from robot frame to odom frame using current_pose yaw (2D)."""
-        if self.current_pose is None:
-            return rx, ry
-        yaw = self._quaternion_to_yaw(self.current_pose.orientation)
-        odom_x = self.current_pose.position.x + (rx * math.cos(yaw) - ry * math.sin(yaw))
-        odom_y = self.current_pose.position.y + (rx * math.sin(yaw) + ry * math.cos(yaw))
-        return odom_x, odom_y
-
-    # ---------- Path utilities ----------
-    def extract_path(self, node, parents):
+    def _extract_path(self, node, parents):
         path = []
         cur = node
         while cur is not None:
@@ -285,7 +334,7 @@ class RRTPlanner(Node):
         path.reverse()
         return path
 
-    def interpolate(self, p1, p2, step=0.05):
+    def _interpolate(self, p1, p2, step=0.05):
         x1, y1 = p1
         x2, y2 = p2
         dist = math.dist(p1, p2)
@@ -295,187 +344,63 @@ class RRTPlanner(Node):
         pts = [(x1 + (x2-x1)*t/steps, y1 + (y2-y1)*t/steps) for t in range(steps+1)]
         return pts
 
-    def smooth_path(self, path, iterations=50):
-        """
-        Random shortcut smoothing: pick two points and try to connect them directly if the straight line is collision-free.
-        """
+    def _path_cost(self, path):
+        length = sum(math.dist(path[i], path[i+1]) for i in range(len(path)-1))
+        penalty = 0.0
+        obs_list = getattr(self, 'obstacles_odom', []) or []
+        for i in range(len(path)-1):
+            mid = ((path[i][0]+path[i+1][0])/2.0, (path[i][1]+path[i+1][1])/2.0)
+            if self.use_map_if_available and self.map is not None:
+                d = min([math.hypot(mid[0]-ox, mid[1]-oy) for (ox,oy) in obs_list], default=1e6)
+            else:
+                d = min((math.hypot(mid[0]-ox, mid[1]-oy) for (ox,oy) in obs_list), default=1e6)
+            thr = self.min_clearance + self.robot_radius
+            if d < thr:
+                penalty += (thr - d)**2
+        return length + penalty*10.0
+
+    def _smooth(self, path, iterations=50):
         if len(path) < 3:
             return path[:]
-        smoothed = path[:]
+        sm = path[:]
         for _ in range(iterations):
-            if len(smoothed) < 3:
+            if len(sm) < 3:
                 break
-            i = random.randint(0, len(smoothed)-2)
-            j = random.randint(i+1, len(smoothed)-1)
+            i = random.randint(0, len(sm)-2)
+            j = random.randint(i+1, len(sm)-1)
             if j <= i+1:
                 continue
-            p_i = smoothed[i]
-            p_j = smoothed[j]
-            # check collision along straight segment
-            if self.collision_free_segment(p_i, p_j, step=0.05, clearance=self.min_clearance):
-                # remove intermediate points between i and j
-                smoothed = smoothed[:i+1] + smoothed[j:]
-        return smoothed
+            a, b = sm[i], sm[j]
+            if self._segment_free(a, b, step=self.segment_check_step, clearance=self.min_clearance):
+                sm = sm[:i+1] + sm[j:]
+        return sm
 
-    # ---------- Execution ----------
-    def follow_path(self):
-        if not self.path or len(self.path) < 2 or self.current_pose is None:
-            self.publish_zero_velocity()
-            return
-
-        # remove reached points
-        while len(self.path) > 1:
-            dx0 = self.path[0][0] - self.current_pose.position.x
-            dy0 = self.path[0][1] - self.current_pose.position.y
-            if math.hypot(dx0, dy0) < self.follow_distance_thresh:
-                self.path.pop(0)
-            else:
-                break
-
-        if len(self.path) < 2:
-            self.publish_zero_velocity()
-            return
-
-        target = self.path[1]
-        dx = target[0] - self.current_pose.position.x
-        dy = target[1] - self.current_pose.position.y
-        distance = math.hypot(dx, dy)
-
-        # If close enough to final goal, pop and stop when empty
-        if distance < self.follow_distance_thresh and len(self.path) <= 2:
-            self.get_logger().info("Goal reached (by follower).")
-            self.path = []
-            self.publish_zero_velocity()
-            return
-
-        current_yaw = self._quaternion_to_yaw(self.current_pose.orientation)
-        target_angle = math.atan2(dy, dx)
-        angle_diff = self._normalize_angle(target_angle - current_yaw)
-
-        cmd = Twist()
-        # angular control first if angle large
-        if abs(angle_diff) > 0.35:
-            cmd.linear.x = 0.0
-            cmd.angular.z = max(-1.0, min(1.0, 1.2 * angle_diff))
-        else:
-            # forward motion with proportional linear and angular
-            cmd.linear.x = min(0.35, 0.6 * distance)
-            cmd.angular.z = max(-1.0, min(1.0, 0.9 * angle_diff))
-
-        self.cmd_vel_pub.publish(cmd)
-
-    def publish_zero_velocity(self):
-        cmd = Twist()
-        self.cmd_vel_pub.publish(cmd)
-
-    # ---------- Visualization ----------
-    def publish_path(self, path_points):
+    def _publish_path(self, path):
         msg = Path()
-        msg.header.frame_id = "odom"
+        msg.header.frame_id = 'odom'
         msg.header.stamp = self.get_clock().now().to_msg()
-        for (x, y) in path_points:
-            pose = PoseStamped()
-            pose.header.frame_id = "odom"
-            pose.pose.position.x = x
-            pose.pose.position.y = y
-            pose.pose.orientation.w = 1.0
-            msg.poses.append(pose)
+        for (x,y) in path:
+            p = PoseStamped()
+            p.header.frame_id = 'odom'
+            p.pose.position.x = x
+            p.pose.position.y = y
+            p.pose.orientation.w = 1.0
+            msg.poses.append(p)
         self.path_pub.publish(msg)
 
-    def publish_markers(self, nodes, path):
-        marker_array = MarkerArray()
+    def _publish_status(self, s: str):
+        st = String()
+        st.data = s
+        self.status_pub.publish(st)
 
-        # nodes (points)
-        node_marker = Marker()
-        node_marker.header.frame_id = "odom"
-        node_marker.header.stamp = self.get_clock().now().to_msg()
-        node_marker.ns = "rrt_nodes"
-        node_marker.id = 0
-        node_marker.type = Marker.POINTS
-        node_marker.action = Marker.ADD
-        node_marker.pose.orientation.w = 1.0
-        node_marker.scale.x = 0.05
-        node_marker.scale.y = 0.05
-        node_marker.color.a = 0.6
-        node_marker.color.r = 0.0
-        node_marker.color.g = 0.7
-        node_marker.color.b = 0.0
-
-        for (x, y) in nodes:
-            p = Point()
-            p.x = x
-            p.y = y
-            p.z = 0.0
-            node_marker.points.append(p)
-        marker_array.markers.append(node_marker)
-
-        # path
-        if path:
-            path_marker = Marker()
-            path_marker.header.frame_id = "odom"
-            path_marker.header.stamp = self.get_clock().now().to_msg()
-            path_marker.ns = "rrt_path"
-            path_marker.id = 1
-            path_marker.type = Marker.LINE_STRIP
-            path_marker.action = Marker.ADD
-            path_marker.pose.orientation.w = 1.0
-            path_marker.scale.x = 0.08
-            path_marker.color.a = 1.0
-            path_marker.color.r = 1.0
-            path_marker.color.g = 0.0
-            path_marker.color.b = 0.0
-            for (x, y) in path:
-                p = Point()
-                p.x = x
-                p.y = y
-                p.z = 0.05
-                path_marker.points.append(p)
-            marker_array.markers.append(path_marker)
-
-        # obstacles visualization (odom frame)
-        if self.obstacles_odom:
-            idx = 2
-            for (ox, oy), (w, h) in self.obstacles_odom:
-                m = Marker()
-                m.header.frame_id = "odom"
-                m.header.stamp = self.get_clock().now().to_msg()
-                m.ns = "rrt_obstacles"
-                m.id = idx
-                idx += 1
-                m.type = Marker.CUBE
-                m.action = Marker.ADD
-                m.pose.position.x = ox
-                m.pose.position.y = oy
-                m.pose.position.z = 0.0
-                m.pose.orientation.w = 1.0
-                m.scale.x = max(w, self.robot_radius*2.0)
-                m.scale.y = max(h, self.robot_radius*2.0)
-                m.scale.z = 0.05
-                m.color.a = 0.6
-                m.color.r = 0.9
-                m.color.g = 0.2
-                m.color.b = 0.2
-                marker_array.markers.append(m)
-
-        self.marker_pub.publish(marker_array)
-
-    # ---------- helpers ----------
-    def _quaternion_to_yaw(self, q: Quaternion):
-        # yaw from quaternion
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    def _quat_to_yaw(self, q):
+        siny_cosp = 2.0*(q.w*q.z + q.x*q.y)
+        cosy_cosp = 1.0 - 2.0*(q.y*q.y + q.z*q.z)
         return math.atan2(siny_cosp, cosy_cosp)
-
-    def _normalize_angle(self, a):
-        while a > math.pi:
-            a -= 2.0 * math.pi
-        while a < -math.pi:
-            a += 2.0 * math.pi
-        return a
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RRTPlanner()
+    node = PlannerNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -484,5 +409,5 @@ def main(args=None):
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

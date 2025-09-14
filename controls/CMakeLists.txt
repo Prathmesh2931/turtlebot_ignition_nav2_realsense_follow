@@ -31,6 +31,7 @@ install(PROGRAMS
   src/pose_error.py
   src/lqr_go_to_goal.py
   src/sequential_follow_lqr.py
+  src/controller_rrt.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

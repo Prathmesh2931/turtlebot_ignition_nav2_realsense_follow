@@ -30,6 +30,9 @@ install(DIRECTORY src
 
 install(PROGRAMS
   src/rrt_planner.py
+  src/only_rrt_plan.py
+  src/teb_local_plan.py
+  src/alt_teb_local_plan.py
   DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
