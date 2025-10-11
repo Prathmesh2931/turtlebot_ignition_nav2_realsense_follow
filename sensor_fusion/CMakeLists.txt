@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(planner)
+project(sensor_fusion)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -24,17 +24,11 @@ if(BUILD_TESTING)
 endif()
 
 install(DIRECTORY src 
-  DESTINATION share/${PROJECT_NAME}
-)
-
+  DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS
-  src/rrt_planner.py
-  src/only_rrt_plan.py
-  src/teb_local_plan.py
-  src/alt_teb_local_plan.py
-  src/rl_local_plan.py
-  src/dmd_trajectory_pred.py
-  DESTINATION lib/${PROJECT_NAME})
+   src/rgb_lidar_fusion.py
+   DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()
