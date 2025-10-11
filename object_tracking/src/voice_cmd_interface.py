@@ -12,16 +12,45 @@ from dotenv import load_dotenv
 from groq import Groq
 import re
 import numpy as np
+from pathlib import Path
 
-load_dotenv()
+# Dynamically locate the .env file — works in both src/ and install/ modes
+from pathlib import Path
+from dotenv import load_dotenv
+
 
 class VoiceObjectController(Node):
     def __init__(self):
         super().__init__('voice_object_controller')
+
+        # Load environment variables
+
+        # Find .env file in package source directory (even when installed)
+        # dotenv_path = Path(__file__).resolve().parents[2] / 'src' / 'navigation2_ignition_gazebo_turtlebot3' / 'object_tracking' / 'src' / '.env'
+        # load_dotenv(dotenv_path)
+        current_dir = Path(__file__).resolve()
+        for parent in current_dir.parents:
+            env_file = parent / ".env"
+            if env_file.exists():
+                load_dotenv(env_file)
+                break
+        else:
+            print("⚠️  .env file not found anywhere above this script.")
+
+
+        # Get Groq API key securely
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            self.get_logger().error("❌ GROQ_API_KEY not found in environment! Check your .env file.")
+            raise ValueError("Missing GROQ_API_KEY in .env")
+
+        # Initialize Groq client
+        self.client = Groq(api_key=api_key)
+
         
         # Groq API setup with updated model
-        api_key = os.environ.get("GROQ_API_KEY", "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")
-        self.client = Groq(api_key=api_key)
+        # api_key = os.environ.get("GROQ_API_KEY", "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")
+        # self.client = Groq(api_key=api_key)
         
         # Publishers
         self.target_object_pub = self.create_publisher(String, '/target_object', 10)
